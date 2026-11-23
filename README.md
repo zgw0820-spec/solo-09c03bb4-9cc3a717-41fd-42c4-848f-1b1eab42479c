@@ -7,6 +7,10 @@
 允许串联，目标可以位于所选目录之外，也可以比链接本身更晚出现。
 恢复结果只包含所选目录；指向同一原件的文件在磁盘上共用一个 inode。
 
+演练收尾时，已发布且不再改动的恢复目录可以按**恢复编号**移入**回收箱**：
+原路径在一次原子 `rename` 后立即消失，到期前可整棵撤回原路径，到期后只允许
+清理。回收箱容量与保留期均可配置，状态持久化，重启不重算保留时钟。
+
 ## 快速开始
 
 ```bash
@@ -52,6 +56,83 @@ curl -s -X POST http://localhost:8000/api/restores \
 > 运行，保证写进 `./restored` 的文件属主正确。可按需覆盖：
 > `RESTORE_UID=$(id -u) RESTORE_GID=$(id -g) docker compose up --build`。
 
+## 回收箱：移入、撤回与到期清理
+
+演练收尾要把临时恢复目录移走、又怕交班后发现还要用。回收箱（recycle bin）
+把“删除”变成有时限、可撤回的操作。
+
+* **移入**：按恢复编号（`POST /api/restores` 返回的 `restore_id`）把
+  `<restored>/<restore-id>` 整棵目录移入回收箱，原路径在**同文件系统的一次
+  原子 rename 后立即消失**。放不下就拒绝（`507`）并保留原路径。
+* **容量计费**：按普通文件**实际占用的磁盘块**（`st_blocks`，每块 512 字节）
+  计费；目录、符号链接等不计；同一目录树内指向同一 inode 的硬链接**只算一次**。
+* **并发不超额**：容量判定在全局锁内完成，并发移入成功占用的总块数永不超过
+  配置容量，超额的请求得到 `507` 且原路径不动。
+* **保留期**：从移入时刻起算，`expires_at` 随状态落盘；**重启不重算**，事后
+  修改保留期配置也不影响已在箱内的条目。
+* **撤回**：到期前可把整棵目录原子移回**原路径**（路径被占用时拒绝，不覆盖）。
+* **到期后**：只允许清理，撤回返回 `409`。
+* **可重试的清理**：自底向上增量删除；中途失败/进程被杀会把条目留在
+  `deleting` 状态且**额度继续保留**，再次调用清理接着删，**删净才释放额度**。
+  慢删期间不持有全局锁，其他目录仍可正常撤回。
+
+### 配置（环境变量）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RECYCLE_CAPACITY_BLOCKS` | `524288`（256 MiB） | 回收箱容量，单位 512 字节块；为 `0` 时拒绝一切移入 |
+| `RECYCLE_RETENTION_SECONDS` | `604800`（7 天） | 保留期秒数，从每个条目移入时起算并固化 |
+| `RECYCLE_DIR` | `<RESTORE_OUTPUT_DIR>/.recycle` | 回收箱目录，**必须与输出目录在同一文件系统** |
+
+`docker-compose.yml` 把演示保留期设为 600 秒、容量设为 128 MiB，方便在
+Swagger 里观察到期与清理；正式值班请调大保留期。回收箱状态写在挂载卷
+`./restored/.recycle/state.json`，容器重启后条目、额度与到期时间全部保留。
+
+### Swagger 演示流程
+
+启动后打开 <http://localhost:8000/docs>，按顺序操作：
+
+1. `POST /api/restores`，body：
+   ```json
+   { "archive": "sample-backup.tar.gz", "path": "data/2024" }
+   ```
+   记下响应里的 `restore_id`（同时确认硬链接共享 inode，`blocks` 计费会去重）。
+2. `POST /api/recycle/items`，body 用上面的编号：
+   ```json
+   { "restore_id": "<上一步的 restore_id>" }
+   ```
+   响应给出 `item_id`、计费 `blocks`、`moved_at`、`expires_at`；宿主
+   `./restored/<restore-id>` 已消失，目录改放在 `./restored/.recycle/items/<item_id>`。
+3. `GET /api/recycle` 查看容量（`used_blocks` / `available_blocks`）与条目；
+   `GET /api/recycle/items/{item_id}` 查看单条。
+4. **到期前**调用 `POST /api/recycle/items/{item_id}/withdraw`，整棵目录回到
+   原路径，文件与硬链接关系不变。
+5. 再移入一次，等过了保留期（演示 600 秒）后：
+   * `POST .../withdraw` 返回 `409`（已到期，只允许清理）；
+   * `POST /api/recycle/cleanup` 删除所有到期条目（以及上次中断、处于
+     `deleting` 的条目），返回 `{"deleted": [...], "failed": [...], "skipped_busy": [...]}`，
+     删净后 `used_blocks` 归零。也可用 `POST /api/recycle/items/{item_id}/cleanup`
+     只清理一条。
+
+命令行等价示例：
+
+```bash
+# 恢复
+RID=$(curl -s -X POST http://localhost:8000/api/restores \
+  -H 'Content-Type: application/json' \
+  -d '{"archive":"sample-backup.tar.gz","path":"data/2024"}' | jq -r .restore_id)
+
+# 移入回收箱
+IID=$(curl -s -X POST http://localhost:8000/api/recycle/items \
+  -H 'Content-Type: application/json' -d "{\"restore_id\":\"$RID\"}" | jq -r .item_id)
+
+# 到期前撤回
+curl -s -X POST http://localhost:8000/api/recycle/items/$IID/withdraw | jq
+
+# 到期后清理
+curl -s -X POST http://localhost:8000/api/recycle/cleanup | jq
+```
+
 ## 示例备份里的跨目录硬链接
 
 `tools/make_sample_archive.py` 生成 `backups/sample-backup.tar.gz`：
@@ -78,11 +159,23 @@ curl -s -X POST http://localhost:8000/api/restores \
 |------|------|------|
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/archives` | 列出可恢复的 `*.tar.gz` / `*.tgz` |
-| `POST` | `/api/restores` | 按 `archive` + `path` 恢复一个子目录 |
+| `POST` | `/api/restores` | 按 `archive` + `path` 恢复一个子目录，响应含 `restore_id` |
+| `GET` | `/api/recycle` | 回收箱容量、额度与全部条目 |
+| `GET` | `/api/recycle/items` | 列出回收箱条目 |
+| `GET` | `/api/recycle/items/{item_id}` | 查看单个条目（含 `expired`） |
+| `POST` | `/api/recycle/items` | 按 `restore_id` 把已发布目录移入回收箱 |
+| `POST` | `/api/recycle/items/{item_id}/withdraw` | 到期前整棵撤回原路径 |
+| `POST` | `/api/recycle/cleanup` | 清理所有到期条目，并重试中断的删除 |
+| `POST` | `/api/recycle/items/{item_id}/cleanup` | 只清理（或重试清理）一条 |
 
-状态码：`201` 成功；`400` 归档名/归档格式非法；`404` 归档或子目录不存在；
+恢复相关状态码：`201` 成功；`400` 归档名/归档格式非法；`404` 归档或子目录不存在；
 `409` 所选路径不是目录；`422` 路径非法、链接缺失/成环、归档成员冲突；
 `429` 并发恢复数超限；`507` 磁盘不足或其它 I/O 错误。
+
+回收箱状态码：`201` 移入成功；`400` 恢复编号非法 / 回收箱与输出目录不在同一
+文件系统；`404` 恢复目录或回收条目不存在；`409` 重复移入、已到期仍撤回、
+原路径已被占用、条目正在删除、对未到期条目发起清理；`507` 回收箱容量不足
+（原路径保留）。
 
 ## 实现要点
 
@@ -101,6 +194,18 @@ curl -s -X POST http://localhost:8000/api/restores \
   数据与硬链接全部就绪、`fsync` 后才 `rename` 到
   `<output>/<restore-id>/<basename>`。任何失败都会删除本次的 staging 与
   发布目录，`/restored` 下不会残留半成品。
+* **回收箱计费**：`os.walk(followlinks=False)` + `lstat` 遍历，按
+  `(st_dev, st_ino)` 去重，每个 inode 只计一次 `st_blocks`；只有普通文件
+  计费，目录/符号链接免费。容量判定在 `RLock` 内完成，并发移入不会超额。
+* **原子移入/撤回**：回收箱默认位于 `<output>/.recycle`，与输出目录同卷，
+  移入与撤回都是一次 `rename`，原路径即时消失/复原；跨文件系统会在移入前
+  明确报错（`400`）而不是落进晦涩的 `EXDEV`。
+* **状态持久化与崩溃协调**：每次变更都经“临时文件 + `fsync` + `os.replace`”
+  原子重写 `state.json`。启动时与磁盘对账：有目录无记录的孤儿目录会被重新
+  计量并收养，有记录无目录的条目会被丢弃，保证不丢数据也不凭空占额。
+* **可重试清理**：自底向上增量删除（符号链接按链接删、不跟随），删除在锁外
+  进行，慢删不阻塞其他条目的撤回；只有整棵目录删净后才删除条目记录并释放
+  额度，中断后重试即可续删。
 * **安全**：拒绝绝对路径、`..` 穿越、重复/类型冲突成员；符号链接、设备、
   FIFO 一律不落盘（`skipped_unsupported` 计数），避免经由链接逃逸。
 
@@ -112,7 +217,8 @@ pip install -r requirements.txt pytest httpx
 pytest -q
 ```
 
-测试覆盖（`tests/test_restore.py`、`tests/test_api.py`）：
+测试覆盖（`tests/test_restore.py`、`tests/test_api.py`、`tests/test_recycle.py`、
+`tests/test_recycle_api.py`）：
 
 * 只恢复所选子目录、跳过兄弟目录与无关大文件；
 * 跨目录、串联、链向链接、前向引用、目录内原件的 inode 共享；
@@ -121,11 +227,25 @@ pytest -q
 * 累计解出字节 ≤ 2×归档负载；
 * 路径穿越、绝对路径、符号链接逃逸、重复目录项、隐式父目录；
 * API 各状态码与 Swagger 可调用的完整 HTTP 流程。
+* 回收箱：磁盘块计费与硬链接只算一次、目录/符号链接免费；
+  容量不足保留原路径、10 路并发移入不超额、重复移入拒绝；
+  撤回复原、到期拒绝撤回、原路径占用拒绝、撤回后可重新移入；
+  保留时钟跨重启不变、改配置不影响存量条目；
+  到期清理、清理中断后状态停在 `deleting` 且额度保留、重试删净才释放；
+  慢删期间其他条目可撤回、并发清理对同一条目跳过；
+  孤儿目录收养、丢失目录记录回收、零容量拒绝；
+  回收相关 API 的完整 HTTP 流程（含 404/409/507 与中断重试）。
 
 ## 已知限制 / 后续工作
 
 * 仅支持 `tar.gz`/`.tgz`（`tar` 的 `r:*` 形式可扩展，当前明确限定 gzip）。
 * 符号链接、设备、FIFO 不恢复；如值班流程需要，应显式加入并做目标校验。
 * 硬链接目标若在归档中重复出现且内容不同，会按“路径唯一”前提视为异常报错。
-* 当前无鉴权、无恢复任务持久化；生产部署应置于内网或加认证，并按需
-  增加过期清理策略（启动时已清理 24 小时前的 staging 残留）。
+* 回收箱与恢复输出目录必须在同一文件系统（移入/撤回依赖原子 `rename`）；
+  跨设备挂载不支持，会在移入前返回 `400`。
+* 块计费基于移入时刻的 `st_blocks` 快照；移入后箱内目录被外部改动不会自动
+  重新计量（回收箱目录不应在服务外被改动）。
+* 崩溃协调只能重建孤儿目录的计量，无法还原其丢失的原始路径，此时按
+  `<输出目录>/<条目名>` 推测，撤回前请人工核对。
+* 当前无鉴权、无恢复任务持久化；生产部署应置于内网或加认证。启动时已清理
+  24 小时前的 staging 残留；回收箱清理由 API 显式触发，暂未内置定时任务。

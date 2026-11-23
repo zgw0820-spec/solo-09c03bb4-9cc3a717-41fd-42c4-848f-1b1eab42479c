@@ -17,6 +17,9 @@ def client(tmp_path, monkeypatch):
     archives.mkdir()
     monkeypatch.setattr(main, "ARCHIVE_DIR", str(archives))
     monkeypatch.setattr(main, "OUTPUT_DIR", str(restored))
+    monkeypatch.delenv("RECYCLE_DIR", raising=False)
+    # Build a recycle bin rooted inside the throwaway output directory.
+    monkeypatch.setattr(main, "recycle_bin", main.build_recycle_bin(str(restored)))
     # Re-create the app-independent state used by lifespan.
     with TestClient(main.app) as c:
         yield c, archives, restored

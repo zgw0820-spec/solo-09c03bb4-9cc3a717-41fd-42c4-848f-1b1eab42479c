@@ -84,6 +84,7 @@ class Member:
 @dataclass
 class RestoreResult:
     requested_path: str
+    restore_id: str = ""
     restored_path: str = ""
     directories: int = 1  # the restored root itself
     files: int = 0
@@ -605,6 +606,7 @@ def restore_directory(
         except (tarfile.TarError, EOFError, zlib.error) as exc:
             raise InvalidArchive(f"corrupt or truncated archive: {exc}") from exc
         stats.restored_path = _publish(token_dir, restore_root, restore_id, basename, fsync)
+        stats.restore_id = restore_id
     except BaseException:
         _cleanup(
             [

@@ -12,6 +12,12 @@ services:
       RESTORE_ARCHIVE_DIR: /backups
       RESTORE_OUTPUT_DIR: /restored
       RESTORE_MAX_CONCURRENT: "2"
+      # Recycle bin. Capacity is metered in 512-byte blocks actually used by
+      # regular files (hard links inside one tree count once): 262144 blocks
+      # = 128 MiB. Retention is 10 minutes for the demo so an expiry/cleanup
+      # can be observed in Swagger without waiting; raise it for real shifts.
+      RECYCLE_CAPACITY_BLOCKS: "262144"
+      RECYCLE_RETENTION_SECONDS: "600"
     volumes:
       # Backups are mounted read-only: the service never writes to them.
       - ./backups:/backups:ro
